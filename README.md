@@ -1,2 +1,2 @@
 # VeriTrace
-VeriTrace is an open-source digital forensics framework that evaluates the integrity of forensic evidence by identifying inconsistencies across multiple Windows artifacts to detect potential anti-forensic activity and evidence tampering.
+VeriTrace is an open-source Python-based DFIR framework that detects potential anti-forensic activity through cross-artifact evidence validation. By correlating Windows forensic artifacts and identifying contradictions between independent sources of evidence, VeriTrace helps investigators assess the trustworthiness of forensic findings, detect evidence tampering, and uncover attempts to conceal malicious or unauthorized activity.
