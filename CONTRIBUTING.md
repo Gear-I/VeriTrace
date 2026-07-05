@@ -220,4 +220,4 @@ By contributing to VeriTrace, you agree that your contributions will be licensed
 
 Thank you for helping improve VeriTrace and supporting the digital forensics community.
 
-Every contribution—whether code, documentation, bug reports, or ideas—is appreciated.
+Every contribution—whether code, documentation, bug reports, or ideas is appreciated.
