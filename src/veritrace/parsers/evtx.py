@@ -6,19 +6,28 @@ within the VeriTrace digital forensics framework.
 
 This module is self-contained: exceptions, data models, XML
 extraction logic, and file-level orchestration all live here so the
-parser can be dropped into a project as a single file.
+parser can be dropped into a project as a single file. The
+command-line entry point supports both a single ``.evtx`` file and a
+folder of ``.evtx`` files.
 
 Requires:
     python-evtx (``pip install python-evtx``)
 
 Example:
-    >>> from evtx_parser import EvtxParser
+    >>> from evtx import EvtxParser
     >>> parser = EvtxParser("Security.evtx")
     >>> records = parser.parse()
     >>> for record in records:
     ...     print(record.record_number, record.event_id, record.provider_name)
     >>> for failure in parser.parse_failures:
     ...     print(failure.record_number, failure.reason)
+
+Command-line usage:
+    Single file:
+        python evtx.py Security.evtx
+
+    Folder of files (parses every .evtx file found):
+        python evtx.py "C:\\path\\to\\evtx_folder"
 """
 
 from __future__ import annotations
@@ -506,24 +515,78 @@ class EvtxParser:
 
 
 # --------------------------------------------------------------------------
+# Batch (folder) orchestration
+# --------------------------------------------------------------------------
+
+
+def parse_folder(folder_path: str | Path) -> dict[Path, list[EventRecord]]:
+    """Parse every ``.evtx`` file found directly inside a folder.
+
+    Files that fail to open entirely (see :class:`EvtxFileError`) are
+    logged and skipped so that one corrupt or inaccessible file does
+    not prevent the rest of the folder from being processed. Per-file
+    parse failures (individual bad records) remain available on each
+    file's own :class:`EvtxParser` instance and are not surfaced
+    here; use :meth:`EvtxParser.parse` directly per file if you need
+    that detail.
+
+    Args:
+        folder_path: Path to a directory containing ``.evtx`` files.
+            Only files directly inside this folder are considered
+            (non-recursive).
+
+    Returns:
+        A dict mapping each successfully parsed file's
+        :class:`~pathlib.Path` to its list of extracted
+        :class:`EventRecord` objects. Files that failed to open are
+        omitted from the returned dict.
+
+    Raises:
+        EvtxFileError: If ``folder_path`` does not exist or is not a
+            directory.
+    """
+    folder = Path(folder_path)
+    if not folder.exists():
+        raise EvtxFileError(f"Folder not found: {folder}")
+    if not folder.is_dir():
+        raise EvtxFileError(f"Path is not a directory: {folder}")
+
+    results: dict[Path, list[EventRecord]] = {}
+    evtx_files = sorted(folder.glob("*.evtx"))
+
+    logger.info("Found %d .evtx file(s) in %s", len(evtx_files), folder)
+
+    for evtx_file in evtx_files:
+        parser = EvtxParser(evtx_file)
+        try:
+            records = parser.parse()
+        except EvtxFileError as exc:
+            logger.error("Skipping file '%s': %s", evtx_file.name, exc)
+            continue
+
+        results[evtx_file] = records
+        if parser.parse_failures:
+            logger.warning(
+                "'%s': %d record(s) failed to parse.",
+                evtx_file.name,
+                len(parser.parse_failures),
+            )
+
+    return results
+
+
+# --------------------------------------------------------------------------
 # Command-line entry point
 # --------------------------------------------------------------------------
 
 
-def _main() -> None:
-    """Run the parser as a script: ``python evtx_parser.py <path-to-file.evtx>``."""
-    import sys
+def _run_single_file(file_path: Path) -> None:
+    """Parse and log the results of a single ``.evtx`` file.
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    if len(sys.argv) != 2:
-        print(f"Usage: python {sys.argv[0]} <path-to-file.evtx>")
-        raise SystemExit(1)
-
-    parser = EvtxParser(sys.argv[1])
+    Args:
+        file_path: Path to the ``.evtx`` file to parse.
+    """
+    parser = EvtxParser(file_path)
     try:
         records = parser.parse()
     except EvtxFileError as exc:
@@ -544,6 +607,69 @@ def _main() -> None:
 
     if parser.parse_failures:
         logger.warning("%d record(s) failed to parse.", len(parser.parse_failures))
+
+
+def _run_folder(folder_path: Path) -> None:
+    """Parse and log a summary of every ``.evtx`` file in a folder.
+
+    Args:
+        folder_path: Path to a directory containing ``.evtx`` files.
+    """
+    try:
+        results = parse_folder(folder_path)
+    except EvtxFileError as exc:
+        logger.error("Batch parsing failed: %s", exc)
+        raise SystemExit(1) from exc
+
+    if not results:
+        logger.warning("No .evtx files were successfully parsed in %s", folder_path)
+        return
+
+    total_records = 0
+    for file_path, records in results.items():
+        total_records += len(records)
+        logger.info("%s: %d record(s) extracted", file_path.name, len(records))
+        if records:
+            first = records[0]
+            logger.info(
+                "  Sample: #%s | EventID=%s | %s | Provider=%s",
+                first.record_number,
+                first.event_id,
+                first.timestamp,
+                first.provider_name,
+            )
+
+    logger.info(
+        "Batch complete: %d file(s) parsed, %d total record(s).",
+        len(results),
+        total_records,
+    )
+
+
+def _main() -> None:
+    """Run the parser as a script against either a single file or a folder.
+
+    Usage:
+        python evtx.py <path-to-file.evtx>
+        python evtx.py <path-to-folder>
+    """
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    if len(sys.argv) != 2:
+        print(f"Usage: python {sys.argv[0]} <path-to-file.evtx-or-folder>")
+        raise SystemExit(1)
+
+    target = Path(sys.argv[1])
+
+    if target.is_dir():
+        _run_folder(target)
+    else:
+        _run_single_file(target)
 
 
 if __name__ == "__main__":
