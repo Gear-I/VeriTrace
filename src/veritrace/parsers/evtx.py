@@ -32,7 +32,10 @@ Command-line usage:
 
 from __future__ import annotations
 
+import html
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +43,23 @@ from xml.etree import ElementTree
 
 from Evtx.Evtx import Evtx
 from Evtx.Views import evtx_record_xml_view
+
+try:
+    from tqdm import tqdm
+
+    _HAS_TQDM = True
+except ImportError:  # pragma: no cover - exercised only when tqdm is absent
+    _HAS_TQDM = False
+
+    def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
+        """Minimal no-op fallback used when ``tqdm`` is not installed.
+
+        Behaves like ``tqdm`` as a pass-through iterator wrapper (so
+        calling code doesn't need conditional logic), but prints no
+        progress bar. Install ``tqdm`` (``pip install tqdm``) for
+        real progress bars.
+        """
+        return iterable
 
 logger = logging.getLogger(__name__)
 
@@ -422,8 +442,18 @@ class EvtxParser:
         self._extractor = extractor if extractor is not None else EventRecordExtractor()
         self.parse_failures: list[RecordParseFailure] = []
 
-    def parse(self) -> list[EventRecord]:
+    def parse(self, show_progress: bool = False) -> list[EventRecord]:
         """Parse the configured ``.evtx`` file into event records.
+
+        Args:
+            show_progress: If ``True``, display a per-record progress
+                bar (via ``tqdm``, if installed) while parsing. The
+                total shown is an estimate taken from the file
+                header's next-record-number field, since EVTX does
+                not store an exact record count up front; the actual
+                number of records processed may be slightly lower if
+                the log has wrapped. Has no effect if ``tqdm`` is not
+                installed.
 
         Returns:
             A list of successfully extracted :class:`EventRecord`
@@ -444,7 +474,16 @@ class EvtxParser:
 
         try:
             with Evtx(str(self.file_path)) as evtx_log:
-                for raw_record in evtx_log.records():
+                record_iter = evtx_log.records()
+                if show_progress:
+                    estimated_total = self._estimate_record_count(evtx_log)
+                    record_iter = tqdm(
+                        record_iter,
+                        total=estimated_total,
+                        desc=self.file_path.name,
+                        unit="rec",
+                    )
+                for raw_record in record_iter:
                     self._process_record(raw_record, records)
         except EvtxFileError:
             raise
@@ -460,6 +499,27 @@ class EvtxParser:
             len(self.parse_failures),
         )
         return records
+
+    @staticmethod
+    def _estimate_record_count(evtx_log: Evtx) -> int | None:
+        """Estimate the number of records in an open EVTX file.
+
+        Used only to size the progress bar; parsing correctness never
+        depends on this estimate.
+
+        Args:
+            evtx_log: An open ``Evtx`` context.
+
+        Returns:
+            The file header's ``next_record_number`` as an estimated
+            upper bound on record count, or ``None`` if it cannot be
+            read (in which case ``tqdm`` falls back to an
+            unbounded/counting progress display).
+        """
+        try:
+            return int(evtx_log.get_file_header().next_record_number())
+        except Exception:  # noqa: BLE001 - progress bar sizing is best-effort
+            return None
 
     def _process_record(self, raw_record: object, records: list[EventRecord]) -> None:
         """Extract a single raw record and append it to ``records`` on success.
@@ -519,21 +579,57 @@ class EvtxParser:
 # --------------------------------------------------------------------------
 
 
-def parse_folder(folder_path: str | Path) -> dict[Path, list[EventRecord]]:
+def _parse_file_worker(file_path: Path) -> tuple[Path, list[EventRecord], int, str | None]:
+    """Parse a single file; designed to run inside a worker process.
+
+    Must be a module-level function (not a method or closure) so it
+    can be pickled and sent to worker processes by
+    ``ProcessPoolExecutor``.
+
+    Args:
+        file_path: Path to the ``.evtx`` file to parse.
+
+    Returns:
+        A tuple of ``(file_path, records, failure_count, error)``.
+        ``error`` is ``None`` on success, or a message describing why
+        the file could not be opened/parsed at all.
+    """
+    parser = EvtxParser(file_path)
+    try:
+        records = parser.parse()
+    except EvtxFileError as exc:
+        return file_path, [], 0, str(exc)
+    return file_path, records, len(parser.parse_failures), None
+
+
+def parse_folder(
+    folder_path: str | Path,
+    show_progress: bool = False,
+    max_workers: int | None = None,
+) -> dict[Path, list[EventRecord]]:
     """Parse every ``.evtx`` file found directly inside a folder.
 
-    Files that fail to open entirely (see :class:`EvtxFileError`) are
-    logged and skipped so that one corrupt or inaccessible file does
-    not prevent the rest of the folder from being processed. Per-file
-    parse failures (individual bad records) remain available on each
-    file's own :class:`EvtxParser` instance and are not surfaced
-    here; use :meth:`EvtxParser.parse` directly per file if you need
+    Files are parsed in parallel across separate processes (EVTX
+    parsing is CPU-bound, so this can substantially reduce total
+    wall-clock time on multi-core machines when a folder has several
+    files). Files that fail to open entirely (see
+    :class:`EvtxFileError`) are logged and skipped so that one
+    corrupt or inaccessible file does not prevent the rest of the
+    folder from being processed. Per-file parse failures (individual
+    bad records within an otherwise-readable file) are logged per
+    file but not returned in bulk here; call
+    :meth:`EvtxParser.parse` directly on a specific file if you need
     that detail.
 
     Args:
         folder_path: Path to a directory containing ``.evtx`` files.
             Only files directly inside this folder are considered
             (non-recursive).
+        show_progress: If ``True``, display a progress bar (via
+            ``tqdm``, if installed) tracking how many files have
+            completed. Has no effect if ``tqdm`` is not installed.
+        max_workers: Maximum number of worker processes to use.
+            Defaults to :func:`os.cpu_count` if not specified.
 
     Returns:
         A dict mapping each successfully parsed file's
@@ -555,24 +651,287 @@ def parse_folder(folder_path: str | Path) -> dict[Path, list[EventRecord]]:
     evtx_files = sorted(folder.glob("*.evtx"))
 
     logger.info("Found %d .evtx file(s) in %s", len(evtx_files), folder)
+    if not evtx_files:
+        return results
 
-    for evtx_file in evtx_files:
-        parser = EvtxParser(evtx_file)
-        try:
-            records = parser.parse()
-        except EvtxFileError as exc:
-            logger.error("Skipping file '%s': %s", evtx_file.name, exc)
-            continue
+    worker_count = max_workers if max_workers is not None else os.cpu_count()
 
-        results[evtx_file] = records
-        if parser.parse_failures:
-            logger.warning(
-                "'%s': %d record(s) failed to parse.",
-                evtx_file.name,
-                len(parser.parse_failures),
-            )
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_parse_file_worker, evtx_file): evtx_file
+            for evtx_file in evtx_files
+        }
+        completed = as_completed(futures)
+        if show_progress:
+            completed = tqdm(completed, total=len(futures), desc="Files", unit="file")
+
+        for future in completed:
+            file_path, records, failure_count, error = future.result()
+            if error is not None:
+                logger.error("Skipping file '%s': %s", file_path.name, error)
+                continue
+            results[file_path] = records
+            if failure_count:
+                logger.warning(
+                    "'%s': %d record(s) failed to parse.", file_path.name, failure_count
+                )
 
     return results
+
+
+# --------------------------------------------------------------------------
+# HTML export
+# --------------------------------------------------------------------------
+
+_HTML_DOCUMENT_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 1.5rem;
+          color: #1a1a1a; background: #fafafa; }}
+  h1 {{ font-size: 1.4rem; margin-bottom: 0.2rem; }}
+  .subtitle {{ color: #555; margin-bottom: 1rem; font-size: 0.9rem; }}
+  .controls {{ margin-bottom: 0.75rem; }}
+  input#filterBox {{ padding: 0.4rem 0.6rem; width: 320px; font-size: 0.9rem;
+                      border: 1px solid #ccc; border-radius: 4px; }}
+  .count {{ color: #555; font-size: 0.85rem; margin-left: 0.75rem; }}
+  table {{ border-collapse: collapse; width: 100%; background: #fff;
+           box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+  th, td {{ border: 1px solid #e0e0e0; padding: 6px 10px; font-size: 0.85rem;
+            text-align: left; vertical-align: top; }}
+  th {{ background: #2d2d2d; color: #fff; position: sticky; top: 0; cursor: pointer;
+        user-select: none; }}
+  th:hover {{ background: #444; }}
+  tr:nth-child(even) {{ background: #f6f6f6; }}
+  tr:hover {{ background: #eef4ff; }}
+  .level-1, .level-2 {{ background: #fdecea !important; }}
+  .level-3 {{ background: #fff8e1 !important; }}
+  .msg-cell {{ max-width: 420px; white-space: pre-wrap; word-break: break-word; }}
+  .failures {{ margin-top: 1.5rem; }}
+  .failures summary {{ cursor: pointer; font-weight: 600; color: #a33; }}
+  .failures ul {{ font-size: 0.85rem; color: #a33; }}
+  .section-title {{ margin-top: 2rem; }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<div class="subtitle">{subtitle}</div>
+<div class="controls">
+  <input type="text" id="filterBox" placeholder="Filter rows..." oninput="filterTables()">
+</div>
+{body}
+<script>
+  function filterTables() {{
+    var query = document.getElementById('filterBox').value.toLowerCase();
+    var tables = document.querySelectorAll('table.records');
+    tables.forEach(function(table) {{
+      var rows = table.querySelectorAll('tbody tr');
+      var visible = 0;
+      rows.forEach(function(row) {{
+        var match = row.textContent.toLowerCase().indexOf(query) !== -1;
+        row.style.display = match ? '' : 'none';
+        if (match) visible++;
+      }});
+      var counter = table.parentElement.querySelector('.count');
+      if (counter) counter.textContent = visible + ' / ' + rows.length + ' rows shown';
+    }});
+  }}
+  function sortTable(table, columnIndex) {{
+    var tbody = table.querySelector('tbody');
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+    var ascending = table.getAttribute('data-sort-col') !== String(columnIndex)
+                     || table.getAttribute('data-sort-dir') === 'desc';
+    rows.sort(function(a, b) {{
+      var av = a.children[columnIndex].textContent.trim();
+      var bv = b.children[columnIndex].textContent.trim();
+      var an = parseFloat(av), bn = parseFloat(bv);
+      var cmp = (!isNaN(an) && !isNaN(bn)) ? (an - bn) : av.localeCompare(bv);
+      return ascending ? cmp : -cmp;
+    }});
+    rows.forEach(function(row) {{ tbody.appendChild(row); }});
+    table.setAttribute('data-sort-col', String(columnIndex));
+    table.setAttribute('data-sort-dir', ascending ? 'asc' : 'desc');
+  }}
+  document.querySelectorAll('table.records th').forEach(function(th, idx) {{
+    th.addEventListener('click', function() {{ sortTable(th.closest('table'), idx); }});
+  }});
+</script>
+</body>
+</html>
+"""
+
+_HTML_TABLE_COLUMNS = (
+    "Record #",
+    "Event ID",
+    "Timestamp (UTC)",
+    "Provider",
+    "Computer",
+    "Channel",
+    "Level",
+    "Message",
+)
+
+
+def _record_to_html_row(record: EventRecord) -> str:
+    """Render a single :class:`EventRecord` as an HTML table row.
+
+    All field values are HTML-escaped to prevent malformed or
+    malicious event content (e.g. a message containing HTML markup)
+    from breaking the generated report.
+
+    Args:
+        record: The event record to render.
+
+    Returns:
+        A ``<tr>...</tr>`` HTML fragment.
+    """
+    level_class = f' class="level-{record.level}"' if record.level is not None else ""
+    cells = (
+        record.record_number,
+        record.event_id if record.event_id is not None else "",
+        record.timestamp.isoformat() if record.timestamp else "",
+        record.provider_name or "",
+        record.computer_name or "",
+        record.channel or "",
+        record.level if record.level is not None else "",
+        record.message or "",
+    )
+    tds = "".join(
+        f'<td class="msg-cell">{html.escape(str(cell))}</td>'
+        if i == len(cells) - 1
+        else f"<td>{html.escape(str(cell))}</td>"
+        for i, cell in enumerate(cells)
+    )
+    return f"<tr{level_class}>{tds}</tr>"
+
+
+def _render_records_table(records: list[EventRecord]) -> str:
+    """Render a list of event records as a filterable/sortable HTML table.
+
+    Args:
+        records: The event records to render.
+
+    Returns:
+        An HTML fragment containing the table and its row count.
+    """
+    header_cells = "".join(f"<th>{html.escape(col)}</th>" for col in _HTML_TABLE_COLUMNS)
+    rows = "".join(_record_to_html_row(record) for record in records)
+    return (
+        f'<div class="table-block">'
+        f'<div class="count">{len(records)} / {len(records)} rows shown</div>'
+        f'<table class="records"><thead><tr>{header_cells}</tr></thead>'
+        f"<tbody>{rows}</tbody></table></div>"
+    )
+
+
+def _render_failures(parse_failures: list[RecordParseFailure]) -> str:
+    """Render a list of parse failures as a collapsible HTML section.
+
+    Args:
+        parse_failures: The failures to render.
+
+    Returns:
+        An HTML fragment, or an empty string if there are no failures.
+    """
+    if not parse_failures:
+        return ""
+    items = "".join(
+        f"<li>Record {html.escape(str(f.record_number))}: {html.escape(f.reason)}</li>"
+        for f in parse_failures
+    )
+    return (
+        f'<details class="failures"><summary>{len(parse_failures)} record(s) '
+        f"failed to parse</summary><ul>{items}</ul></details>"
+    )
+
+
+def export_to_html(
+    records: list[EventRecord],
+    output_path: str | Path,
+    source_label: str | None = None,
+    parse_failures: list[RecordParseFailure] | None = None,
+) -> Path:
+    """Export a list of event records to a self-contained HTML report.
+
+    The report includes a live text filter box and clickable
+    column-sort headers (implemented in vanilla JavaScript, no
+    external dependencies), so the output file can be opened and
+    explored directly in a browser without any server or additional
+    tooling.
+
+    Args:
+        records: The event records to export.
+        output_path: Path to write the ``.html`` file to. Parent
+            directories are created if they don't already exist.
+        source_label: A human-readable label for the source file,
+            shown in the report title/subtitle. Defaults to
+            ``"EVTX Report"`` if not provided.
+        parse_failures: Optional list of records that failed to
+            parse, rendered as a collapsible section for visibility
+            into anti-forensic indicators (e.g. corrupted records).
+
+    Returns:
+        The :class:`~pathlib.Path` the report was written to.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    title = source_label or "EVTX Report"
+    subtitle = f"{len(records)} record(s) extracted"
+    body = _render_records_table(records)
+    if parse_failures:
+        body += _render_failures(parse_failures)
+
+    document = _HTML_DOCUMENT_TEMPLATE.format(
+        title=html.escape(title), subtitle=html.escape(subtitle), body=body
+    )
+    output_path.write_text(document, encoding="utf-8")
+    logger.info("Wrote HTML report: %s", output_path)
+    return output_path
+
+
+def export_folder_to_html(
+    results: dict[Path, list[EventRecord]], output_path: str | Path
+) -> Path:
+    """Export folder-level batch parse results to one combined HTML report.
+
+    Each source file gets its own titled, filterable/sortable table
+    within a single output document.
+
+    Args:
+        results: Mapping of source file path to its extracted
+            records, as returned by :func:`parse_folder`.
+        output_path: Path to write the combined ``.html`` file to.
+            Parent directories are created if they don't already
+            exist.
+
+    Returns:
+        The :class:`~pathlib.Path` the report was written to.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total_records = sum(len(records) for records in results.values())
+    sections = []
+    for file_path, records in results.items():
+        sections.append(
+            f'<h2 class="section-title">{html.escape(file_path.name)}</h2>'
+            + _render_records_table(records)
+        )
+    body = "".join(sections)
+
+    document = _HTML_DOCUMENT_TEMPLATE.format(
+        title=html.escape("VeriTrace EVTX Batch Report"),
+        subtitle=html.escape(
+            f"{len(results)} file(s), {total_records} total record(s)"
+        ),
+        body=body,
+    )
+    output_path.write_text(document, encoding="utf-8")
+    logger.info("Wrote HTML batch report: %s", output_path)
+    return output_path
 
 
 # --------------------------------------------------------------------------
@@ -580,49 +939,77 @@ def parse_folder(folder_path: str | Path) -> dict[Path, list[EventRecord]]:
 # --------------------------------------------------------------------------
 
 
-def _run_single_file(file_path: Path) -> None:
+def _run_single_file(file_path: Path, show_progress: bool, html_output: Path | None) -> None:
     """Parse and log the results of a single ``.evtx`` file.
 
     Args:
         file_path: Path to the ``.evtx`` file to parse.
+        show_progress: Whether to display a per-record progress bar.
+        html_output: If provided, export results to this HTML file
+            path instead of (in addition to) logging each record.
     """
     parser = EvtxParser(file_path)
     try:
-        records = parser.parse()
+        records = parser.parse(show_progress=show_progress)
     except EvtxFileError as exc:
         logger.error("Parsing failed: %s", exc)
         raise SystemExit(1) from exc
 
-    for record in records:
-        logger.info(
-            "Record %s | EventID=%s | %s | Provider=%s | Channel=%s | Level=%s | Computer=%s",
-            record.record_number,
-            record.event_id,
-            record.timestamp,
-            record.provider_name,
-            record.channel,
-            record.level,
-            record.computer_name,
+    if html_output is not None:
+        export_to_html(
+            records,
+            html_output,
+            source_label=file_path.name,
+            parse_failures=parser.parse_failures,
         )
+    else:
+        for record in records:
+            logger.info(
+                "Record %s | EventID=%s | %s | Provider=%s | Channel=%s | Level=%s | Computer=%s",
+                record.record_number,
+                record.event_id,
+                record.timestamp,
+                record.provider_name,
+                record.channel,
+                record.level,
+                record.computer_name,
+            )
 
     if parser.parse_failures:
         logger.warning("%d record(s) failed to parse.", len(parser.parse_failures))
 
 
-def _run_folder(folder_path: Path) -> None:
+def _run_folder(
+    folder_path: Path,
+    show_progress: bool,
+    max_workers: int | None,
+    html_output: Path | None,
+) -> None:
     """Parse and log a summary of every ``.evtx`` file in a folder.
 
     Args:
         folder_path: Path to a directory containing ``.evtx`` files.
+        show_progress: Whether to display a per-file progress bar.
+        max_workers: Maximum number of worker processes to use for
+            parallel parsing. ``None`` uses :func:`os.cpu_count`.
+        html_output: If provided, export combined results to this
+            HTML file path instead of (in addition to) logging a
+            per-file summary.
     """
     try:
-        results = parse_folder(folder_path)
+        results = parse_folder(
+            folder_path, show_progress=show_progress, max_workers=max_workers
+        )
     except EvtxFileError as exc:
         logger.error("Batch parsing failed: %s", exc)
         raise SystemExit(1) from exc
 
     if not results:
         logger.warning("No .evtx files were successfully parsed in %s", folder_path)
+        return
+
+    if html_output is not None:
+        export_folder_to_html(results, html_output)
         return
 
     total_records = 0
@@ -650,26 +1037,61 @@ def _main() -> None:
     """Run the parser as a script against either a single file or a folder.
 
     Usage:
-        python evtx.py <path-to-file.evtx>
-        python evtx.py <path-to-folder>
+        python evtx.py <path-to-file.evtx-or-folder> [options]
+
+    Options:
+        --progress          Show a progress bar while parsing
+                             (requires ``pip install tqdm`` for a
+                             real bar; otherwise silently ignored).
+        --html PATH          Export results to an HTML report at
+                             PATH instead of logging each record.
+        --workers N          Max parallel worker processes to use
+                             when parsing a folder (default: all
+                             available CPU cores).
     """
-    import sys
+    import argparse
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    if len(sys.argv) != 2:
-        print(f"Usage: python {sys.argv[0]} <path-to-file.evtx-or-folder>")
-        raise SystemExit(1)
+    parser = argparse.ArgumentParser(
+        prog="evtx.py",
+        description="Parse a Windows .evtx file or a folder of .evtx files.",
+    )
+    parser.add_argument("target", help="Path to a .evtx file or a folder of .evtx files.")
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show a progress bar while parsing (requires tqdm).",
+    )
+    parser.add_argument(
+        "--html",
+        metavar="PATH",
+        default=None,
+        help="Export results to an HTML report at PATH.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Max parallel worker processes when parsing a folder (default: all cores).",
+    )
+    args = parser.parse_args()
 
-    target = Path(sys.argv[1])
+    if args.progress and not _HAS_TQDM:
+        logger.warning("tqdm is not installed; --progress will have no visible effect. "
+                        "Install it with: pip install tqdm")
+
+    target = Path(args.target)
+    html_output = Path(args.html) if args.html else None
 
     if target.is_dir():
-        _run_folder(target)
+        _run_folder(target, args.progress, args.workers, html_output)
     else:
-        _run_single_file(target)
+        _run_single_file(target, args.progress, html_output)
 
 
 if __name__ == "__main__":
