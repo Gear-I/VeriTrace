@@ -30,8 +30,16 @@ Command-line usage:
         python evtx.py "C:\\path\\to\\evtx_folder"
 """
 
+# pylint: disable=too-many-lines
+# This module is intentionally kept as a single, self-contained file
+# (exceptions + data models + extraction + orchestration + CLI + HTML
+# export) so it can be dropped into a project without pulling in
+# sibling modules. Splitting it would improve this metric but work
+# against that portability goal.
+
 from __future__ import annotations
 
+import argparse
 import html
 import logging
 import os
@@ -51,13 +59,19 @@ try:
 except ImportError:  # pragma: no cover - exercised only when tqdm is absent
     _HAS_TQDM = False
 
-    def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
+    def tqdm(iterable, **_kwargs):  # type: ignore[no-redef]
         """Minimal no-op fallback used when ``tqdm`` is not installed.
 
         Behaves like ``tqdm`` as a pass-through iterator wrapper (so
         calling code doesn't need conditional logic), but prints no
         progress bar. Install ``tqdm`` (``pip install tqdm``) for
         real progress bars.
+
+        Args:
+            iterable: The iterable to pass through unchanged.
+            **_kwargs: Accepted for signature compatibility with the
+                real ``tqdm`` (e.g. ``total``, ``desc``, ``unit``);
+                intentionally unused here.
         """
         return iterable
 
@@ -108,8 +122,15 @@ class RecordExtractionError(EvtxParsingError):
 
 
 @dataclass(frozen=True, slots=True)
-class EventRecord:
+class EventRecord:  # pylint: disable=too-many-instance-attributes
     """A single parsed Windows Event Log record.
+
+    Note:
+        Each field below is a distinct, independently meaningful
+        forensic attribute of a Windows event record; the field count
+        reflects the EVTX schema itself, not incidental class
+        complexity, so ``too-many-instance-attributes`` is
+        intentionally suppressed for this dataclass.
 
     Attributes:
         record_number: The EVTX record number, unique within a single
@@ -179,8 +200,15 @@ class RecordParseFailure:
 # --------------------------------------------------------------------------
 
 
-class EventRecordExtractor:
+class EventRecordExtractor:  # pylint: disable=too-few-public-methods
     """Extracts :class:`EventRecord` instances from Windows Event XML.
+
+    Note:
+        This class exposes a single public entry point (``extract``)
+        backed by several private helper methods — a deliberate
+        single-responsibility design, not a class that "should" have
+        more public surface area, so ``too-few-public-methods`` is
+        intentionally suppressed here.
 
     This class is stateless: it holds no per-file or per-record state
     between calls, so a single instance may safely be reused across
@@ -398,8 +426,14 @@ class EventRecordExtractor:
 # --------------------------------------------------------------------------
 
 
-class EvtxParser:
+class EvtxParser:  # pylint: disable=too-few-public-methods
     """Parses a Windows ``.evtx`` file into a list of :class:`EventRecord` objects.
+
+    Note:
+        This class exposes a single public entry point (``parse``)
+        backed by several private helper methods — a deliberate
+        single-responsibility design, so
+        ``too-few-public-methods`` is intentionally suppressed here.
 
     The parser is resilient to per-record corruption: if an
     individual record cannot be read or converted, the failure is
@@ -518,7 +552,10 @@ class EvtxParser:
         """
         try:
             return int(evtx_log.get_file_header().next_record_number())
-        except Exception:  # noqa: BLE001 - progress bar sizing is best-effort
+        except Exception:  # noqa: BLE001 pylint: disable=broad-exception-caught
+            # Progress bar sizing is best-effort only; any failure here
+            # (e.g. an unusual/corrupt file header) must never abort
+            # the actual parse, so we deliberately catch broadly.
             return None
 
     def _process_record(self, raw_record: object, records: list[EventRecord]) -> None:
@@ -549,7 +586,12 @@ class EvtxParser:
             self.parse_failures.append(
                 RecordParseFailure(record_number=record_number, reason=str(exc))
             )
-        except Exception as exc:  # noqa: BLE001 - isolate any unexpected per-record error
+        except Exception as exc:  # noqa: BLE001 pylint: disable=broad-exception-caught
+            # Deliberately broad: this isolates ANY unexpected failure to a
+            # single record so one corrupt/anti-forensically-damaged record
+            # cannot abort parsing of the rest of the file. See module
+            # docstring / RecordExtractionError for the narrower, expected
+            # failure path this complements.
             logger.warning(
                 "Skipping record %s due to unexpected error: %s", record_number, exc
             )
@@ -1049,8 +1091,6 @@ def _main() -> None:
                              when parsing a folder (default: all
                              available CPU cores).
     """
-    import argparse
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
