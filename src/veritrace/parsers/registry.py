@@ -28,6 +28,7 @@ Example:
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -176,8 +177,13 @@ class ParseFailure:
 # --------------------------------------------------------------------------
 
 
-class RegistryValueExtractor:
+class RegistryValueExtractor:  # pylint: disable=too-few-public-methods
     """Extracts :class:`RegistryValue` instances from raw hive value objects.
+
+    Note:
+        This class exposes a single public entry point (``extract``)
+        — a deliberate single-responsibility design, so
+        ``too-few-public-methods`` is intentionally suppressed here.
 
     This class is stateless: it holds no per-hive or per-value state
     between calls, so a single instance may safely be reused across
@@ -248,8 +254,14 @@ class RegistryValueExtractor:
 # --------------------------------------------------------------------------
 
 
-class RegistryHiveParser:
+class RegistryHiveParser:  # pylint: disable=too-few-public-methods
     """Parses a Windows registry hive file into keys and values.
+
+    Note:
+        This class exposes a single public entry point (``parse``)
+        backed by several private helper methods — a deliberate
+        single-responsibility design, so
+        ``too-few-public-methods`` is intentionally suppressed here.
 
     The parser walks the key tree recursively starting from either
     the hive root or an optional scoped root path, and is resilient
@@ -275,7 +287,8 @@ class RegistryHiveParser:
 
         >>> # Scope the walk to a specific subtree:
         >>> parser = RegistryHiveParser("NTUSER.DAT")
-        >>> keys, values = parser.parse(root_path="Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run")
+        >>> run_key = "Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run"
+        >>> keys, values = parser.parse(root_path=run_key)
     """
 
     def __init__(
@@ -419,7 +432,10 @@ class RegistryHiveParser:
             logger.warning("Skipping key '%s': %s", key_path, exc)
             self.parse_failures.append(ParseFailure(path=key_path, reason=str(exc)))
             return
-        except Exception as exc:  # noqa: BLE001 - isolate any unexpected per-key error
+        except Exception as exc:  # noqa: BLE001 pylint: disable=broad-exception-caught
+            # Deliberately broad: isolates ANY unexpected failure to this
+            # single key so one corrupt/damaged key cannot abort the walk
+            # of the rest of the hive tree.
             logger.warning("Skipping key '%s' due to unexpected error: %s", key_path, exc)
             self.parse_failures.append(ParseFailure(path=key_path, reason=str(exc)))
             return
@@ -428,7 +444,10 @@ class RegistryHiveParser:
 
         try:
             subkeys = list(raw_key.subkeys())
-        except Exception as exc:  # noqa: BLE001 - underlying parser failure
+        except Exception as exc:  # noqa: BLE001 pylint: disable=broad-exception-caught
+            # Deliberately broad: a subkey enumeration failure under one
+            # key must not abort parsing of sibling keys elsewhere in
+            # the hive.
             logger.warning(
                 "Failed to enumerate subkeys of '%s': %s", key_path, exc
             )
@@ -490,7 +509,9 @@ class RegistryHiveParser:
         """
         try:
             raw_values = list(raw_key.values())
-        except Exception as exc:  # noqa: BLE001 - underlying parser failure
+        except Exception as exc:  # noqa: BLE001 pylint: disable=broad-exception-caught
+            # Deliberately broad: a value enumeration failure under one
+            # key must not abort parsing of the rest of the hive.
             logger.warning("Failed to enumerate values of '%s': %s", key_path, exc)
             self.parse_failures.append(
                 ParseFailure(path=key_path, reason=f"Failed to enumerate values: {exc}")
@@ -504,7 +525,10 @@ class RegistryHiveParser:
             except ValueExtractionError as exc:
                 logger.warning("Skipping value under '%s': %s", key_path, exc)
                 self.parse_failures.append(ParseFailure(path=key_path, reason=str(exc)))
-            except Exception as exc:  # noqa: BLE001 - isolate unexpected per-value error
+            except Exception as exc:  # noqa: BLE001 pylint: disable=broad-exception-caught
+                # Deliberately broad: isolates ANY unexpected failure to this
+                # single value so one corrupt value cannot abort extraction
+                # of sibling values or keys elsewhere in the hive.
                 logger.warning(
                     "Skipping value under '%s' due to unexpected error: %s", key_path, exc
                 )
@@ -552,8 +576,6 @@ class RegistryHiveParser:
 
 def _main() -> None:
     """Run the parser as a script: ``python registry_parser.py <hive-file> [root_path]``."""
-    import sys
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
